@@ -76,15 +76,21 @@ jobs:
         run: |
           dnf install -y \
             nodejs npm \
-            rust cargo \
+            curl wget file git \
             webkit2gtk4.1-devel \
             openssl-devel \
             libappindicator-gtk3-devel \
             librsvg2-devel \
             libxdo-devel \
             patchelf \
-            gcc gcc-c++ \
-            curl wget file git
+            gcc gcc-c++
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          source "$HOME/.cargo/env"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup show
 
       - run: npm ci
 
