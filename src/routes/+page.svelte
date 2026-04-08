@@ -1,156 +1,244 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { onMount } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
+  import {
+    savedConnections,
+    activeConnectionId,
+    activeStats,
+    connectedIds,
+    jobs,
+    formatBytes,
+    type ConnectionConfig,
+    type StorageStats,
+    type UploadJob,
+    type UploadProgress,
+  } from '$lib/stores';
+  import ConnectionModal from '$lib/ConnectionModal.svelte';
+  import FolderBrowser from '$lib/FolderBrowser.svelte';
+  import JobPanel from '$lib/JobPanel.svelte';
 
-  let name = $state("");
-  let greetMsg = $state("");
+  let showModal = $state(false);
+  let editConfig = $state<ConnectionConfig | null>(null);
+  let connecting = $state<string | null>(null);
+  let connectError = $state('');
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  onMount(async () => {
+    // Load saved connections
+    try {
+      const configs = await invoke<ConnectionConfig[]>('get_saved_connections');
+      savedConnections.set(configs);
+    } catch {}
+
+    // Listen for upload progress events
+    listen<UploadProgress>('upload-progress', (event) => {
+      const p = event.payload;
+      jobs.update((list: UploadJob[]) =>
+        list.map((job: UploadJob) =>
+          job.id === p.job_id
+            ? {
+                ...job,
+                transferred_bytes: p.transferred_bytes,
+                total_bytes: p.total_bytes,
+                speed_bps: p.speed_bps,
+                eta_seconds: p.eta_seconds,
+                status: p.status,
+                current_file: p.current_file,
+              }
+            : job
+        )
+      );
+    });
+  });
+
+  async function connect(config: ConnectionConfig) {
+    if ($connectedIds.has(config.id)) {
+      activeConnectionId.set(config.id);
+      await refreshStats(config.id);
+      return;
+    }
+    connecting = config.id;
+    connectError = '';
+    try {
+      const stats = await invoke<StorageStats>('connect_storage_box', { config });
+      connectedIds.update((s: Set<string>) => new Set([...s, config.id]));
+      activeConnectionId.set(config.id);
+      activeStats.set(stats);
+    } catch (e) {
+      connectError = String(e);
+    } finally {
+      connecting = null;
+    }
   }
+
+  async function refreshStats(id: string) {
+    try {
+      const stats = await invoke<StorageStats>('get_storage_stats', { connectionId: id });
+      activeStats.set(stats);
+    } catch {}
+  }
+
+  async function disconnect(id: string) {
+    await invoke('disconnect_storage_box', { connectionId: id }).catch(() => {});
+    connectedIds.update((s: Set<string>) => { s.delete(id); return new Set(s); });
+    if ($activeConnectionId === id) {
+      activeConnectionId.set(null);
+      activeStats.set(null);
+    }
+  }
+
+  async function deleteConnection(config: ConnectionConfig) {
+    await disconnect(config.id);
+    await invoke('delete_connection', { id: config.id }).catch(() => {});
+    savedConnections.update((list: ConnectionConfig[]) => list.filter((c: ConnectionConfig) => c.id !== config.id));
+  }
+
+  function openNewConnection() {
+    editConfig = null;
+    showModal = true;
+  }
+
+  function openEditConnection(config: ConnectionConfig) {
+    editConfig = config;
+    showModal = true;
+  }
+
+  let usedPercent = $derived(
+    $activeStats && $activeStats.total_bytes > 0
+      ? ($activeStats.used_bytes / $activeStats.total_bytes) * 100
+      : 0
+  );
+
+  let activeConfig = $derived(
+    $savedConnections.find((c: ConnectionConfig) => c.id === $activeConnectionId) ?? null
+  );
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<!-- Connection Modal -->
+<ConnectionModal bind:open={showModal} {editConfig} />
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+<!-- App Layout -->
+<div class="flex flex-col h-screen bg-surface-900 text-surface-50">
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
-</main>
+  <!-- Top Bar -->
+  <header class="flex items-center gap-3 px-4 py-2 bg-surface-800 border-b border-surface-700 shrink-0">
+    <!-- Connection Dropdown -->
+    <div class="flex items-center gap-2 flex-1">
+      <span class="text-sm font-semibold text-surface-300 shrink-0">Storage Box:</span>
+      <select
+        class="select text-sm bg-surface-700 border-surface-600 rounded px-2 py-1 max-w-xs"
+        value={$activeConnectionId ?? ''}
+        onchange={(e) => {
+          const id = (e.target as HTMLSelectElement).value;
+          if (!id) { activeConnectionId.set(null); activeStats.set(null); return; }
+          const cfg = $savedConnections.find((c: ConnectionConfig) => c.id === id);
+          if (cfg) connect(cfg);
+        }}
+      >
+        <option value="">— Select connection —</option>
+        {#each $savedConnections as cfg}
+          <option value={cfg.id}>
+            {cfg.name} {$connectedIds.has(cfg.id) ? '●' : '○'}
+          </option>
+        {/each}
+      </select>
 
-<style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
+      {#if connecting}
+        <span class="text-xs text-surface-400">Connecting…</span>
+      {/if}
+      {#if connectError}
+        <span class="text-xs text-error-400 truncate max-w-xs">{connectError}</span>
+      {/if}
+    </div>
 
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
+    <!-- Storage stats -->
+    {#if $activeStats}
+      <div class="flex items-center gap-2 shrink-0">
+        <div class="text-xs text-surface-300">
+          {#if $activeStats.total_bytes > 0}
+            {formatBytes($activeStats.used_bytes)} / {formatBytes($activeStats.total_bytes)}
+          {:else}
+            {formatBytes($activeStats.used_bytes)} used
+          {/if}
+        </div>
+        {#if $activeStats.total_bytes > 0}
+          <div class="w-24 bg-surface-600 rounded-full h-1.5" title="{usedPercent.toFixed(1)}%">
+            <div
+              class="h-1.5 rounded-full transition-all {usedPercent > 90 ? 'bg-error-500' : usedPercent > 70 ? 'bg-warning-500' : 'bg-success-500'}"
+              style="width: {usedPercent}%"
+            ></div>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
+    <!-- Actions -->
+    <div class="flex gap-2 shrink-0">
+      {#if $activeConnectionId}
+        <button
+          class="btn btn-sm preset-tonal text-xs"
+          onclick={() => activeConfig && openEditConnection(activeConfig)}
+          title="Edit connection"
+        >✎</button>
+        <button
+          class="btn btn-sm preset-tonal text-xs"
+          onclick={() => $activeConnectionId && disconnect($activeConnectionId)}
+          title="Disconnect"
+        >✕</button>
+      {/if}
+      <button class="btn btn-sm preset-filled-primary-500 text-xs" onclick={openNewConnection}>
+        + New
+      </button>
+    </div>
+  </header>
 
-  color: #0f0f0f;
-  background-color: #f6f6f6;
+  <!-- Main Content -->
+  {#if !$activeConnectionId}
+    <!-- No connection selected -->
+    <div class="flex-1 flex flex-col items-center justify-center gap-4 text-center p-8">
+      <p class="text-surface-400 text-lg">No storage box connected</p>
+      {#if $savedConnections.length > 0}
+        <p class="text-surface-500 text-sm">Select a connection from the dropdown above</p>
+        <div class="space-y-2 w-full max-w-sm">
+          {#each $savedConnections as cfg}
+            <button
+              class="w-full btn preset-tonal flex justify-between items-center"
+              onclick={() => connect(cfg)}
+              disabled={connecting === cfg.id}
+            >
+              <span>{cfg.name}</span>
+              <span class="text-xs text-surface-400">{cfg.host}</span>
+            </button>
+          {/each}
+        </div>
+      {:else}
+        <button class="btn preset-filled-primary-500" onclick={openNewConnection}>
+          Add your first connection
+        </button>
+      {/if}
+    </div>
+  {:else}
+    <!-- Two-panel layout -->
+    <div class="flex flex-1 overflow-hidden">
+      <!-- Left: Folder Browser -->
+      <div class="w-2/5 border-r border-surface-700 overflow-hidden flex flex-col">
+        <div class="px-3 py-1.5 bg-surface-800 border-b border-surface-700 text-xs font-semibold text-surface-400 uppercase">
+          Browser
+        </div>
+        <div class="flex-1 overflow-hidden">
+          <FolderBrowser connectionId={$activeConnectionId} />
+        </div>
+      </div>
 
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
-</style>
+      <!-- Right: Jobs -->
+      <div class="flex-1 overflow-hidden flex flex-col">
+        <div class="px-3 py-1.5 bg-surface-800 border-b border-surface-700 text-xs font-semibold text-surface-400 uppercase">
+          Upload Jobs
+        </div>
+        <div class="flex-1 overflow-hidden">
+          <JobPanel />
+        </div>
+      </div>
+    </div>
+  {/if}
+</div>
